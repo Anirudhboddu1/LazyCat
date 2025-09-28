@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Lazy Cat</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <h1>🐱 Lazy Cat</h1>
+  </header>
+
+  <section class="card">
+    <button id="btnToggle">🎤 Start Listening</button>
+    <p id="status">Idle</p>
+  </section>
+
+  <section class="card">
+    <h2>Transcript & Actions</h2>
+    <pre id="transcript"></pre>
+  </section>
+
+  <!-- New: Voice settings (purely to improve recognition) -->
+  <section class="card">
+    <h2>Voice settings</h2>
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <label for="lang">Language</label>
+      <select id="lang">
+        <option value="en-US" selected>English (US)</option>
+        <option value="en-GB">English (UK)</option>
+        <option value="en-IN">English (India)</option>
+        <option value="en-AU">English (Australia)</option>
+        <option value="en-CA">English (Canada)</option>
+      </select>
+
+      <label for="wakeSensitivity" title="Lower = stricter wake; Higher = more tolerant">
+        Wake sensitivity
+      </label>
+      <input id="wakeSensitivity" type="range" min="0" max="2" step="1" value="1" />
+    </div>
+  </section>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

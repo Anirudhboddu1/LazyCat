@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Lazy Cat — Steps 1 to 3.2",
+  "version": "0.3.2",
+  "description": "Voice → AI JSON → actions (open_tab, scroll, search_web, click_ui) using Chrome built-in on-device AI.",
+  "action": {
+    "default_title": "Lazy Cat",
+    "default_popup": "popup.html"
+  },
+  "permissions": ["tabs", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
