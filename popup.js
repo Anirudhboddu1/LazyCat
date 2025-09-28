@@ -104,7 +104,7 @@ async function aiInterpret(commandText) {
       properties: {
         command: {
           type: "string",
-          enum: ["open_tab", "scroll", "search_web", "click_ui", "summarize"]
+          enum: ["open_tab", "scroll", "search_web", "click_ui", "summarize", "rewrite_selection"] // + rewrite_selection
         },
         args: {
           type: "object",
@@ -118,7 +118,9 @@ async function aiInterpret(commandText) {
             // click_ui
             text: { type: "string" },
             // summarize
-            target: { type: "string", enum: ["auto", "selection", "email", "page"] }
+            target: { type: "string", enum: ["auto", "selection", "email", "page"] },
+            // rewrite_selection
+            tone: { type: "string" } // ← free-form tone (e.g., "apologetic", "enthusiastic", "legal", "casual", etc.)
           },
           additionalProperties: false
         },
@@ -149,6 +151,7 @@ async function aiInterpret(commandText) {
           "For search_web: command='search_web', args.query is the user's search terms.\n" +
           "For click_ui: command='click_ui', args.text is the visible label to click.\n" +
           "For summarize: command='summarize', args.target is 'auto' unless user says selection/email/page.\n" +
+          "For rewrite_selection: command='rewrite_selection'. args.tone is free-form (e.g., 'apologetic', 'enthusiastic', 'legal', 'casual'). If missing, assume 'natural'. Return ONLY the rewritten text (no quotes/fences/commentary), preserve meaning and key details.\n" +
           "Never invent other fields. Never output any text outside the JSON."
       },
       { role: "user", content: commandText }
@@ -166,6 +169,13 @@ async function aiInterpret(commandText) {
       parsed = JSON.parse(cleaned);
     } catch {
       parsed = { command: "noop", args: {}, confirmation: "none", error: "Could not parse AI output" };
+    }
+
+    // Intercept rewrite_selection (must run in a page, not the background worker)
+    if (parsed.command === "rewrite_selection") {
+      const tone = (parsed.args?.tone || "natural").trim();
+      await handleRewriteSelectionFromPopup(tone);
+      return;
     }
 
     appendTranscript("🤖 " + JSON.stringify(parsed, null, 2));
@@ -443,4 +453,158 @@ if (wakeSensitivityEl) {
     localStorage.setItem("lc_wake_sens", wakeSensitivityEl.value);
     setStatus(`Wake sensitivity: ${wakeSensitivityEl.value}`);
   });
+}
+
+// ===== Rewrite selection helper (3.3A1)
+async function handleRewriteSelectionFromPopup(tone = "professional") {
+  try {
+    // 1) Get selected/focused text from the active tab
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) { appendTranscript("⚠️ No active tab for rewrite"); return; }
+
+    const [{ result: extract }] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      args: [],
+      func: () => {
+        const sel = window.getSelection();
+        const hasSelection = sel && sel.rangeCount && sel.toString().trim().length > 0;
+
+        // Focused element (input/textarea/contenteditable)
+        const ae = document.activeElement;
+        const isTextInput =
+          ae && ((ae.tagName === "TEXTAREA") ||
+          (ae.tagName === "INPUT" && /^(text|search|email|tel|url|password)$/i.test(ae.type)) ||
+          ae.isContentEditable);
+
+        let mode = "none";
+        let text = "";
+
+        if (hasSelection) {
+          mode = "selection";
+          text = sel.toString();
+        } else if (isTextInput) {
+          mode = ae.isContentEditable ? "contenteditable" :
+                 (ae.tagName === "TEXTAREA" ? "textarea" : "input");
+          text = ae.value ?? ae.innerText ?? "";
+          // If no explicit selection in input, rewrite whole field
+          if ((mode === "input" || mode === "textarea") && typeof ae.selectionStart === "number" && ae.selectionStart !== ae.selectionEnd) {
+            mode = mode + "_range"; // input_range / textarea_range
+            text = (ae.value || "").substring(ae.selectionStart, ae.selectionEnd);
+          } else if (mode === "contenteditable" && hasSelection) {
+            mode = "contenteditable_range";
+            text = sel.toString();
+          }
+        }
+
+        // Clamp to keep latency sane
+        const clamp = (s, max = 20000) => (s || "").slice(0, max);
+        return { mode, text: clamp(text) };
+      }
+    });
+
+    if (!extract || !extract.text) {
+      appendTranscript("⚠️ No selection or editable text to rewrite");
+      return;
+    }
+
+    // 2) Rewrite using on-device Prompt API
+    const lmAvail = await LanguageModel.availability();
+    if (lmAvail === "unavailable") {
+      appendTranscript("⚠️ Prompt API unavailable on this device.");
+      return;
+    }
+
+    const session = await LanguageModel.create({
+      output: { type: "text", languageCode: "en" } // expect plain text back
+    });
+
+    // Keep prompt simple and deterministic: model should return ONLY the rewritten text
+    const styleHint =
+      tone === "friendly" ? "friendly and warm"
+      : tone === "concise" ? "more concise and clear"
+      : tone === "neutral" ? "neutral and clear"
+      : "professional and polite";
+
+    const prompt = [
+      { role: "system", content: "Rewrite the user's text. Return ONLY the rewritten text, no quotes, no code fences, no commentary." },
+      { role: "user", content: `Tone/style: ${styleHint}\n\nText:\n${extract.text}` }
+    ];
+
+    const raw = await session.prompt(prompt);
+    session.destroy?.();
+
+    // Sanitize: strip accidental fences/quotes/whitespace
+    const rewritten = String(raw).replace(/```[\s\S]*?```/g, "").trim();
+    if (!rewritten) {
+      appendTranscript("⚠️ Rewrite produced empty output");
+      return;
+    }
+
+    // 3) Try to replace text in page
+    const [{ result: replaced }] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      args: [extract.mode, rewritten],
+      func: (mode, newText) => {
+        const fire = (el) => {
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        };
+
+        const sel = window.getSelection();
+
+        // Inputs/Textareas (with or without range)
+        if (mode === "input" || mode === "textarea") {
+          const ae = document.activeElement;
+          if (!ae) return { success: false, reason: "no_active_element" };
+          const desc = mode;
+          const setter = Object.getOwnPropertyDescriptor(ae.__proto__, "value") ||
+                         Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value") ||
+                         Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value");
+          setter?.set?.call(ae, newText);
+          fire(ae);
+          return { success: true, where: desc };
+        }
+        if (mode === "input_range" || mode === "textarea_range") {
+          const ae = document.activeElement;
+          if (!ae || typeof ae.selectionStart !== "number") return { success: false, reason: "no_range" };
+          const start = ae.selectionStart, end = ae.selectionEnd;
+          ae.setRangeText(newText, start, end, "end");
+          fire(ae);
+          return { success: true, where: mode };
+        }
+
+        // Contenteditable
+        if (mode === "contenteditable") {
+          const ae = document.activeElement;
+          if (!ae || !ae.isContentEditable) return { success: false, reason: "no_contenteditable" };
+          ae.innerText = newText;
+          fire(ae);
+          return { success: true, where: "contenteditable" };
+        }
+        if (mode === "contenteditable_range" || mode === "selection") {
+          if (!sel || !sel.rangeCount) return { success: false, reason: "no_selection_range" };
+          const range = sel.getRangeAt(0);
+          range.deleteContents();
+          range.insertNode(document.createTextNode(newText));
+          // move caret to end
+          range.collapse(false);
+          sel.removeAllRanges();
+          sel.addRange(range);
+          return { success: true, where: mode };
+        }
+
+        return { success: false, reason: "unsupported_mode" };
+      }
+    });
+
+    // 4) Show result in popup regardless of replacement success
+    appendTranscript(`✍️ Rewritten (${tone}):\n${rewritten}`);
+    if (!replaced?.success) {
+      appendTranscript(`ℹ️ Could not auto-insert (${replaced?.reason || "unknown"}). You can copy from above.`);
+    } else {
+      appendTranscript(`✅ Inserted into ${replaced.where}.`);
+    }
+  } catch (err) {
+    appendTranscript("❌ Rewrite error: " + err.message);
+  }
 }
